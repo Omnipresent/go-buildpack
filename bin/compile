@@ -1,306 +1,386 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# usage: bin/compile <build-dir> <cache-dir> <env-dir>
 
-# The Cloud Foundry Python Buildpack. This script accepts parameters for a build
-# directory, a cache directory, and a directory for app environment variables.
-
-# Usage:
-#
-#     $ bin/compile <build-dir> <cache-dir> <env-path>
-
-# Fail fast and fail hard.
 set -eo pipefail
 
-[ "$BUILDPACK_XTRACE" ] && set -o xtrace
-
-# Prepend proper path for virtualenv hackery. This will be deprecated soon.
-export PATH=:/usr/local/bin:$PATH
-
-# Paths.
-BIN_DIR=$(cd $(dirname $0); pwd) # absolute path
-ROOT_DIR=$(dirname $BIN_DIR)
-BUILD_DIR=$1
-CACHE_DIR=$2
-ENV_DIR=$3
-
-# Use miniconda if environment.yml exists and exit
-if [ -f $BUILD_DIR/environment.yml ]; then
-  echo "----------------- USING CONDA BUILDPACK -----------------"
-  $BIN_DIR/steps/conda-install $BUILD_DIR $CACHE_DIR
-  exit 0
+mkdir -p "$1" "$2"
+build=$(cd "$1/" && pwd)
+cache=$(cd "$2/" && pwd)
+env_dir="${3}"
+buildpack=$(cd "$(dirname $0)/.." && pwd)
+arch=$(uname -m|tr A-Z a-z)
+if test $arch = x86_64
+then arch=amd64
 fi
+plat=$(uname|tr A-Z a-z)-$arch
+PATH=$buildpack/$plat/bin:$PATH
 
-$ROOT_DIR/compile-extensions/bin/check_stack_support
+steptxt="----->"
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+NC='\033[0m' # No Color
+CURL="curl -s -L --retry 15 --retry-delay 2" # retry for up to 30 seconds
 
-# The ROOT_DIR is read only so we can't install dependencies in it
-# Move the ROOT_DIR contents to tmp and point ROOT_DIR to the new root
-TMP_ROOT=/tmp/buildpack
-rm -rf $TMP_ROOT
-cp -r $ROOT_DIR $TMP_ROOT
-ROOT_DIR=$TMP_ROOT
-cd $ROOT_DIR
-
-# Cloud Foundry does not have support for Logplex.
-function bpwatch() {
-  :
-}
+default_go_version="$($buildpack/compile-extensions/bin/default_version_for $buildpack/manifest.yml go)"
+DefaultGoVersion="go${default_go_version}"
+TOOL=""
 
 # CF Common
-BUILDPACK_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )"/.. && pwd )"
+BUILDPACK_PATH=$buildpack
 export BUILDPACK_PATH
-source $BUILDPACK_PATH/compile-extensions/lib/common
+source $buildpack/compile-extensions/lib/common
+$BUILDPACK_PATH/compile-extensions/bin/check_stack_support
+$BUILDPACK_PATH/compile-extensions/bin/download_dependency godep /tmp
+tar -xzf /tmp/godep -C /tmp
+$BUILDPACK_PATH/compile-extensions/bin/download_dependency glide /tmp
+tar -xzf /tmp/glide -C /tmp
+PATH=/tmp/bin:$PATH
 # END CF Common
 
-# Static configurations for virtualenv caches.
-VIRTUALENV_LOC=".heroku/venv"
-LEGACY_TRIGGER="lib/python2.7"
+handleDefaultPkgSpec() {
+    if [ "$pkgs" = "default" ];
+    then
+        warn "Installing package '.' (default)"
+        pkgs="."
+    fi
+}
 
-DEFAULT_PYTHON_VERSION="python-$($BUILDPACK_PATH/compile-extensions/bin/default_version_for $BUILDPACK_PATH/manifest.yml python)"
-PYTHON_EXE="/app/.heroku/python/bin/python"
-PIP_VERSION="8.1.2"
-SETUPTOOLS_VERSION="25.2.0"
+massagePkgSpecForVendor() {
+    local t=""
+    for pkg in $(echo $pkgs); do
+      if [ "${pkg:0:1}" = "." ] || [ ! -d "./vendor/$pkg" ]; then
+        t+="${pkg} "
+      else
+        t+="${name}/vendor/${pkg} "
+      fi
+    done
+    pkgs="${t}"
+}
 
-# Common Problem Warnings
-export WARNINGS_LOG=$(mktemp)
-export RECOMMENDED_PYTHON_VERSION=$DEFAULT_PYTHON_VERSION
+# Go releases have moved to a new URL scheme
+# starting with Go version 1.2.2. Return the old
+# location for known old versions and the new
+# location otherwise.
+urlFor() {
+    ver=$1
+    file=$2
+    case $ver in
+    go1.0*|go1.1beta*|go1.1rc*|go1.1|go1.1.*|go1.2beta*|go1.2rc*|go1.2|go1.2.1)
+        echo https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/go/$file
+        ;;
+    *)
+        echo https://storage.googleapis.com/golang/$file
+        ;;
+    esac
+}
 
-# Setup bpwatch
-export PATH=$PATH:$ROOT_DIR/vendor/bpwatch
-LOGPLEX_KEY="t.b90d9d29-5388-4908-9737-b4576af1d4ce"
-export BPWATCH_STORE_PATH=$CACHE_DIR/bpwatch.json
-BUILDPACK_VERSION=v28
+# Expand to supported versions of Go, (e.g. expand "go1.5" to latest release go1.5.2)
+# All specific or other versions, take as is.
+expandVer() {
+  buildpack_dir=$1
+  target_version=$2
+  highest_ver="$($buildpack_dir/compile-extensions/bin/highest_version $buildpack_dir/manifest.yml go $target_version)"
 
-# Setup pip-pop (pip-diff)
-export PATH=$PATH:$ROOT_DIR/vendor/pip-pop
-
-# Support Anvil Build_IDs
-[ ! "$SLUG_ID" ] && SLUG_ID="defaultslug"
-[ ! "$REQUEST_ID" ] && REQUEST_ID=$SLUG_ID
-
-# Sanitizing environment variables.
-unset GIT_DIR PYTHONHOME PYTHONPATH
-unset RECEIVE_DATA RUN_KEY BUILD_INFO DEPLOY LOG_TOKEN DYNO
-unset CYTOKINE_LOG_FILE GEM_PATH
-
-# Setup buildpack instrumentation.
-bpwatch init $LOGPLEX_KEY
-bpwatch build python $BUILDPACK_VERSION $REQUEST_ID
-TMP_APP_DIR=$CACHE_DIR/tmp_app_dir
-
-bpwatch start compile
-
-# Syntax sugar.
-source $BIN_DIR/utils
-
-# Directory Hacks for path consistency.
-APP_DIR='/app'
-TMP_APP_DIR=$CACHE_DIR/tmp_app_dir
-
-
-# Skip these steps for Docker.
-if [[ ! "$DOCKER_BUILD" ]]; then
-
-  # Copy Anvil app dir to temporary storage...
-  bpwatch start anvil_appdir_stage
-  if [ "$SLUG_ID" ]; then
-    mkdir -p $TMP_APP_DIR
-    deep-mv $APP_DIR $TMP_APP_DIR
+  if [ "$highest_ver" = "" ]; then
+    echo $target_version
   else
-    deep-rm $APP_DIR
+    echo $highest_ver
   fi
-  bpwatch stop anvil_appdir_stage
+}
 
-  # Copy Application code in.
-  bpwatch start appdir_stage
-    deep-cp $BUILD_DIR $APP_DIR
-  bpwatch stop appdir_stage
+# Report deprecated versions to user
+# Use after expandVer
+reportVer() {
+  : # unsupported versions in Cloud Foundry will fail to push; no deprecation warnings needed
+}
+
+warnGoVersionOverride() {
+  if test ! -z "${GOVERSION}"
+  then
+    warn "Using \$GOVERSION override."
+    warn "     \$GOVERSION = ${GOVERSION}"
+    warn ""
+    warn "If this isn't what you want please run:'"
+    warn "  cf unset-env <app> GOVERSION"
+    warn ""
+  fi
+}
+
+warnPackageSpecOverride() {
+  if test ! -z "${GO_INSTALL_PACKAGE_SPEC}"
+  then
+    warn "Using \$GO_INSTALL_PACKAGE_SPEC override."
+    warn "     \$GO_INSTALL_PACKAGE_SPEC = ${GO_INSTALL_PACKAGE_SPEC}"
+    warn ""
+    warn "If this isn't what you want please run:'"
+    warn "  cf unset-env <app> GO_INSTALL_PACKAGE_SPEC"
+    warn ""
+  fi
+}
+
+# Sets up GOPATH (and posibly other GO* env vars) and returns the location of
+# the source code as $src. The output of this function is meant to be eval'd'
+setupGOPATH() {
+    local name="${1}"
+    local t="$(mktemp -d)"
+
+    if test "${GO_SETUP_GOPATH_IN_IMAGE}" = "true"
+    then
+        mv -t ${t} ${build}/*
+        GOPATH="${build}"
+    else
+        cp -R ${build}/* ${t}
+        GOPATH="${t}/.go"
+        echo export GOBIN="${build}/bin"
+    fi
+
+    local src="${GOPATH}/src/${name}"
+    mkdir -p "${src}"
+    mv -t "${src}" "${t}"/*
+
+    echo "GOPATH=${GOPATH}"
+    echo "src=${src}"
+}
+
+source "${buildpack}/lib/common.sh"
+loadEnvDir "${env_dir}"
+determineTool
+
+ver=$(expandVer $buildpack $ver)
+file=${GOFILE:-$ver.linux-amd64.tar.gz}
+url=${GOURL:-$(urlFor $ver $file)}
+
+if test -e $build/bin && ! test -d $build/bin
+then
+    err ""
+    err "File bin exists and is not a directory."
+    err ""
+    exit 1
 fi
 
+reportVer $ver
 
-# Set new context.
-ORIG_BUILD_DIR=$BUILD_DIR
-BUILD_DIR=$APP_DIR
-
-# Set up outputs under new context
-PROFILE_PATH="$BUILD_DIR/.profile.d/python.sh"
-GUNICORN_PROFILE_PATH="$BUILD_DIR/.profile.d/python.gunicorn.sh"
-
-# We'll need to send these statics to other scripts we `source`.
-export BUILD_DIR CACHE_DIR BIN_DIR PROFILE_PATH
-
-# Prepend proper environment variables for Python use.
-export PATH=$BUILD_DIR/.heroku/python/bin:$BUILD_DIR/.heroku/vendor/bin:$PATH
-export PYTHONUNBUFFERED=1
-export LANG=en_US.UTF-8
-export C_INCLUDE_PATH=/app/.heroku/vendor/include:$BUILD_DIR/.heroku/vendor/include:/app/.heroku/python/include:$C_INCLUDE_PATH
-export CPLUS_INCLUDE_PATH=/app/.heroku/vendor/include:$BUILD_DIR/.heroku/vendor/include:/app/.heroku/python/include:$CPLUS_INCLUDE_PATH
-export LIBRARY_PATH=/app/.heroku/vendor/lib:$BUILD_DIR/.heroku/vendor/lib:/app/.heroku/python/lib:$LIBRARY_PATH
-export LD_LIBRARY_PATH=/app/.heroku/vendor/lib:$BUILD_DIR/.heroku/vendor/lib:/app/.heroku/python/lib:$LD_LIBRARY_PATH
-export PKG_CONFIG_PATH=/app/.heroku/vendor/lib/pkg-config:$BUILD_DIR/.heroku/vendor/lib/pkg-config:/app/.heroku/python/lib/pkg-config:$PKG_CONFIG_PATH
-
-# Switch to the repo's context.
-cd $BUILD_DIR
-
-# Warn for lack of Procfile.
-if [[ ! -f Procfile ]]; then
-  puts-warn 'Warning: Your application is missing a Procfile. This file tells Cloud Foundry how to run your application.'
-  puts-warn 'Learn more: https://docs.cloudfoundry.org/buildpacks/prod-server.html#procfile'
-fi
-
-# Experimental pre_compile hook.
-bpwatch start pre_compile
-  source $BIN_DIR/steps/hooks/pre_compile
-bpwatch stop pre_compile
-
-# If no requirements.txt file given, assume `setup.py develop` is intended.
-if [ ! -f requirements.txt ]; then
-  echo "-e ." > requirements.txt
-fi
-
-
-# Sticky runtimes.
-if [ -f $CACHE_DIR/.heroku/python-version ]; then
-  DEFAULT_PYTHON_VERSION=$(cat $CACHE_DIR/.heroku/python-version)
-fi
-
-# Stack fallback for non-declared caches.
-if [ -f $CACHE_DIR/.heroku/python-stack ]; then
-  CACHED_PYTHON_STACK=$(cat $CACHE_DIR/.heroku/python-stack)
+if test -d "${cache}/${ver}/go"
+then
+    step "Using ${ver}"
 else
-  CACHED_PYTHON_STACK=$STACK
+    rm -rf ${cache}/* # be sure not to build up cruft
+    mkdir -p "${cache}/${ver}"
+    cd "${cache}/${ver}"
+       exit_code=0
+
+      filtered_url=$($BUILDPACK_PATH/compile-extensions/bin/download_dependency $ver $PWD) || exit_code=$?
+      if [ $exit_code -ne 0 ]; then
+        echo -e "`$buildpack/compile-extensions/bin/recommend_dependency $ver`" 1>&2
+        exit 22
+      fi
+
+      start "Installing ${ver}"
+        tar zxf $ver
+        rm $ver
+      finished
+
+      echo "Downloaded [$filtered_url]"
+    cd - >/dev/null
 fi
 
-# If no runtime given, assume default version.
-if [ ! -f runtime.txt ]; then
-  echo $DEFAULT_PYTHON_VERSION > runtime.txt
+mkdir -p $build/bin
+export GOROOT="${cache}/${ver}/go"
+PATH="${PATH}:${GOROOT}/bin"
+
+# If $GO_LINKER_SYMBOL and GO_LINKER_VALUE are set, tell the linker to DTRT
+FLAGS=(-tags cloudfoundry)
+if [ -n "${GO_LINKER_SYMBOL}" -a -n "${GO_LINKER_VALUE}" ]
+then
+    case $ver in
+    go1.5*|go1.6*)
+        xval="${GO_LINKER_SYMBOL}=${GO_LINKER_VALUE}"
+        ;;
+    *)
+        xval="${GO_LINKER_SYMBOL} ${GO_LINKER_VALUE}"
+        ;;
+    esac
+    FLAGS+=(-ldflags "-X ${xval}")
 fi
 
-# Prepare the cache.
-mkdir -p $CACHE_DIR
+export GOPATH
 
-# Purge "old-style" virtualenvs.
-bpwatch start clear_old_venvs
-  [ -d $CACHE_DIR/$LEGACY_TRIGGER ] && rm -fr $CACHE_DIR/.heroku/bin $CACHE_DIR/.heroku/lib $CACHE_DIR/.heroku/include
-  [ -d $CACHE_DIR/$VIRTUALENV_LOC ] && rm -fr $CACHE_DIR/.heroku/venv $CACHE_DIR/.heroku/src
-bpwatch stop clear_old_venvs
+case ${TOOL} in
+    godep)
+        eval "$(setupGOPATH ${name})"
+        godepsJSON="${src}/Godeps/Godeps.json"
 
-# Restore old artifacts from the cache.
-bpwatch start restore_cache
-    mkdir -p .heroku
+        pkgs=${GO_INSTALL_PACKAGE_SPEC:-$(<${godepsJSON} jq -r 'if .Packages then .Packages | join(" ") else "default" end')}
+        warnPackageSpecOverride
+        handleDefaultPkgSpec
 
-    cp -R $CACHE_DIR/.heroku/python .heroku/ &> /dev/null || true
-    cp -R $CACHE_DIR/.heroku/python-stack .heroku/ &> /dev/null || true
-    cp -R $CACHE_DIR/.heroku/python-version .heroku/ &> /dev/null || true
-    cp -R $CACHE_DIR/.heroku/vendor .heroku/ &> /dev/null || true
-    cp -R $CACHE_DIR/.heroku/venv .heroku/ &> /dev/null || true
+        case $ver in
+        go1.5*)
+            if test "$GO15VENDOREXPERIMENT" = "1"
+            then
+                warn ""
+                warn "\$GO15VENDOREXPERIMENT=1. This is an experiment. Things may not work as expected."
+                warn "See https://docs.cloudfoundry.org/buildpacks/go/index.html#go%201.5 for more info."
+                warn ""
+               VendorExperiment="true"
+            fi
+        ;;
+        go1.6*)
+            if test "$GO15VENDOREXPERIMENT" = "0" || test -d "${src}/Godeps/_workspace/src"
+            then
+                VendorExperiment="false"
+            else
+                VendorExperiment="true"
+            fi
+            FLAGS+=(--buildmode=pie)
+        ;;
+        go1.7*)
+          if test -n "$GO15VENDOREXPERIMENT"
+          then
+            err ""
+            err "GO15VENDOREXPERIMENT is set, but is not supported by go1.7"
+            err "run `cf unset-env <app> GO15VENDOREXPERIMENT`"
+            err "before pushing again."
+            err ""
+            exit 1
+          fi
+          VendorExperiment="true"
+        ;;
+        *)
+            VendorExperiment="false"
+        ;;
+        esac
 
-bpwatch stop restore_cache
+        unset GIT_DIR # unset git dir or it will mess with goinstall
+        cd "${src}"
+        if test "$VendorExperiment" = "true"
+        then
+            if test ! -d "$build/vendor"
+            then
+              warn ""
+              warn "vendor/ directory does not exist."
+              warn ""
+            fi
+            massagePkgSpecForVendor
+            step "Running: go install -v ${FLAGS[@]} ${pkgs}"
+            go install -v "${FLAGS[@]}" ${pkgs} 2>&1
+        else
+            step "Running: godep go install -v ${FLAGS[@]} ${pkgs}"
+            godep go install -v "${FLAGS[@]}" ${pkgs} 2>&1
+        fi
+    ;;
+    go_nativevendoring)
+        eval "$(setupGOPATH ${name})"
 
-set +e
-# Create set-aside `.heroku` folder.
-mkdir .heroku &> /dev/null
-set -e
+        pkgs=${GO_INSTALL_PACKAGE_SPEC-"default"}
+        handleDefaultPkgSpec
 
-mkdir -p $(dirname $PROFILE_PATH)
+        case $ver in
+        go1.5*)
+            if ! test "$GO15VENDOREXPERIMENT" = "1"
+            then
+                warn ""
+                warn "\$GO15VENDOREXPERIMENT is not =1. To use vendor your packages in vendor/"
+                warn "for go 1.5 this environment variable must be set to 1."
+                warn ""
+                exit 1
+            fi
+        ;;
+        go1.6*)
+            if test "$GO15VENDOREXPERIMENT" = "0"
+            then
+                warn ""
+                warn "\$GO15VENDOREXPERIMENT=0. To use vendor your packages in vendor/"
+                warn "for go 1.6 this environment variable must unset or set to 1."
+                warn ""
+                exit 1
+            fi
+        ;;
+        esac
 
-# Install Python.
-source $BIN_DIR/steps/python
+        unset GIT_DIR # unset git dir or it will mess with goinstall
+        cd "${src}"
 
-# Sanity check for setuptools/distribute.
-source $BIN_DIR/steps/setuptools
+        massagePkgSpecForVendor
 
-# Uninstall removed dependencies with Pip.
-source $BIN_DIR/steps/pip-uninstall
+        step "Running: go install -v ${FLAGS[@]} ${pkgs}"
+        go install -v "${FLAGS[@]}" ${pkgs} 2>&1
+    ;;
+    glide)
+        # Do this before setupGOPATH as we need ${name} set first
+        cd "${build}"
+        name=$(glide name 2>/dev/null)
 
-# Mercurial support.
-source $BIN_DIR/steps/mercurial
+        eval "$(setupGOPATH ${name})"
 
-# Pylibmc support.
-source $BIN_DIR/steps/pylibmc
+        pkgs=${GO_INSTALL_PACKAGE_SPEC:-"default"}
+        handleDefaultPkgSpec
 
-# Leptonica support
-source $BIN_DIR/steps/leptonica
+        unset GIT_DIR
+        cd "${src}"
 
-# Opencv support
-source $BIN_DIR/steps/opencv
+        number_of_vendor_subdirectories=0
+        if [ -d "vendor" ]; then
+          number_of_vendor_subdirectories=$(find vendor -mindepth 1 -maxdepth 1 -type d | wc -l)
+        fi
 
-# Tesseract support
-source $BIN_DIR/steps/tesseract
+        if [ "$number_of_vendor_subdirectories" -eq 0 ]
+        then
+            step "Fetching any unsaved dependencies (glide install)"
+            glide install 2>&1
+        else
+            step "Note: skipping (glide install) due to non-empty vendor directory."
+        fi
 
-# Tessdata support
-source $BIN_DIR/steps/tessdata
+        massagePkgSpecForVendor
 
-# ghostscript 
-source $BIN_DIR/steps/ghostscript
+        step "Running: go install -v ${FLAGS[@]} ${pkgs}"
+        go install -v "${FLAGS[@]}" ${pkgs} 2>&1
+    ;;
+# GB installation currently unsupported
+    gb)
+        warn ""
+        warn "Error: Cloud Foundry does not support the GB package manager"
+        warn "We currently only support the Godep and Glide package managers for go apps"
+        warn "For support please file an issue: https://github.com/cloudfoundry/go-buildpack/issues"
+        warn ""
+        exit 1
+    ;;
+esac
 
-# python gs 
-source $BIN_DIR/steps/gs
+echo -e "---\ndefault_process_types:\n  web: $(basename $name)" >> /tmp/buildpack-release-step.yml
 
-# Libffi support.
-source $BIN_DIR/steps/cryptography
+if test ! -z "${src}" -a "${src}" != "${build}" -a -e "${src}/Procfile"
+then
+  mv -t "${build}" "${src}/Procfile"
+fi
 
-# Support for Geo libraries.
-sub-env $BIN_DIR/steps/geo-libs
+if ! test -e $build/Procfile && test -n "${name}"
+then
+  echo -e "web: $(basename $name)" >> $build/Procfile
+fi
 
-# GDAL support.
-source $BIN_DIR/steps/gdal
+cd $build
+mkdir -p $build/.profile.d
+echo 'PATH=$PATH:$HOME/bin' > $build/.profile.d/go.sh
 
-# Install dependencies with Pip.
-source $BIN_DIR/steps/pip-install
+if test "${GO_INSTALL_TOOLS_IN_IMAGE}" = "true"
+then
+    start "Copying go tool chain to \$GOROOT=\$HOME/.heroku/go"
+        mkdir -p "${build}/.heroku/go"
+        cp -a "${GOROOT}/"* "${build}/.heroku/go"
+        echo 'export GOROOT=$HOME/.heroku/go' > "${build}/.profile.d/goroot.sh"
+        echo 'PATH=$PATH:$GOROOT/bin' >> "${build}/.profile.d/goroot.sh"
+    finished
+    step "Copying ${TOOL} binary"
+    cp $(which ${TOOL}) "${build}/bin"
+fi
 
-# Django collectstatic support.
-sub-env $BIN_DIR/steps/collectstatic
-
-
-# Create .profile script for application runtime environment variables.
-set-env PATH '$HOME/.heroku/python/bin:$PATH'
-set-env PYTHONUNBUFFERED true
-set-env PYTHONHOME /app/.heroku/python
-set-env LIBRARY_PATH '/app/.heroku/vendor/lib:/app/.heroku/python/lib:$LIBRARY_PATH'
-set-env LD_LIBRARY_PATH '/app/.heroku/vendor/lib:/app/.heroku/python/lib:$LD_LIBRARY_PATH'
-set-default-env LANG en_US.UTF-8
-set-default-env PYTHONHASHSEED random
-set-default-env PYTHONPATH /app/
-
-# Install sane-default script for $WEB_CONCURRENCY and $FORWARDED_ALLOW_IPS.
-cp $ROOT_DIR/vendor/python.gunicorn.sh $GUNICORN_PROFILE_PATH
-
-
-# Experimental post_compile hook.
-bpwatch start post_compile
-  source $BIN_DIR/steps/hooks/post_compile
-bpwatch stop post_compile
-
-# Store new artifacts in cache.
-bpwatch start dump_cache
-
-  rm -rf $CACHE_DIR/.heroku/python
-  rm -rf $CACHE_DIR/.heroku/python-version
-  rm -rf $CACHE_DIR/.heroku/python-stack
-  rm -rf $CACHE_DIR/.heroku/vendor
-  rm -rf $CACHE_DIR/.heroku/venv
-
-  mkdir -p $CACHE_DIR/.heroku
-  cp -R .heroku/python $CACHE_DIR/.heroku/
-  cp -R .heroku/python-version $CACHE_DIR/.heroku/
-  cp -R .heroku/python-stack $CACHE_DIR/.heroku/ &> /dev/null || true
-  cp -R .heroku/vendor $CACHE_DIR/.heroku/ &> /dev/null || true
-  cp -R .heroku/venv $CACHE_DIR/.heroku/ &> /dev/null || true
-
-bpwatch stop dump_cache
-
-# Fin.
-if [[ ! "$DOCKER_BUILD" ]]; then
-
-  bpwatch start appdir_commit
-    deep-rm $ORIG_BUILD_DIR
-    deep-mv $BUILD_DIR $ORIG_BUILD_DIR
-  bpwatch stop appdir_commit
-
-  bpwatch start anvil_appdir_commit
-  if [ "$SLUG_ID" ]; then
-    deep-mv $TMP_APP_DIR $APP_DIR
-  fi
-
-  bpwatch stop anvil_appdir_commit
-  bpwatch stop compile
+if test "${GO_SETUP_GOPATH_IN_IMAGE}" = "true"
+then
+    start "Cleaning up \$GOPATH/pkg"
+        rm -rf $GOPATH/pkg
+    finished
+    echo 'export GOPATH=$HOME' > "${build}/.profile.d/zzgopath.sh"  #Try to make sure it's down in towards the end
+    echo 'cd $GOPATH/src/'${name} >> "${build}/.profile.d/zzgopath.sh" # because of this
 fi
